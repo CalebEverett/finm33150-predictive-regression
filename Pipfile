@@ -24,6 +24,12 @@ tabulate = "*"
 nbformat = "*"
 ipywidgets = "*"
 boto3 = "*"
+statsmodels = "*"
+patsy = "*"
+jupyter-contrib-nbextensions = "*"
+jupyterthemes = "*"
+psutil = "*"
+kaleido = "*"
 
 [requires]
 python_version = "3.8"

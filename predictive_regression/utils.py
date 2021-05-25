@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import os
 from typing import Dict, List
 from urllib.request import urlretrieve
@@ -10,12 +11,15 @@ from canvasapi import Canvas
 import numpy as np
 import numpy as np
 import pandas as pd
+from patsy import dmatrices
 import plotly.graph_objects as go
+import plotly.express as px
 from plotly import colors
 from plotly.subplots import make_subplots
 import quandl
 import requests
 from scipy import stats
+import statsmodels.api as sm
 from tqdm.notebook import tqdm
 
 # =============================================================================
@@ -182,351 +186,172 @@ def download_s3_file(filename: str):
 
 
 # =============================================================================
-# Strategy
+# Prepare Data
 # =============================================================================
 
 
-def get_accum_df(
-    df: pd.DataFrame,
-    arrival_time: str = "2018-04-08 22:05",
-    quantity=3.25e9,
-    side: int = 1,
-    participation=0.050,
-    max_trade_participation=0.10,
-    chunk_size=6.5e9,
-    price_window_ms=200,
-):
-    """Creates accumulation data frame that trades can be calculated from."""
-
-    # Create accumulation dataframe
-    df_accum = df.loc[arrival_time:].copy()
-    df_accum["CumSizeBillionths"] = df_accum.SizeBillionths.cumsum()
-
-    df_accum = df_accum[df_accum.Side == side].copy()
-
-    price_agg = {1: "max", -1: "min"}[side]
-    df_accum = (
-        df_accum.reset_index()
-        .groupby("timestamp_utc_nanoseconds")
-        .agg(
-            {
-                "CumSizeBillionths": "max",
-                "SizeBillionths": "sum",
-                "PriceMillionths": price_agg,
-                "Side": "first",
-            }
-        )
-    )
-
-    df_accum["CumChunks"] = df_accum.CumSizeBillionths.floordiv(chunk_size)
-    df_accum["CumParticipation"] = (
-        (
-            (
-                df_accum.CumChunks.map(
-                    df_accum.groupby("CumChunks").min()["CumSizeBillionths"].iloc[1:]
-                )
-                * participation
-            )
-            .fillna(0)
-            .apply(lambda x: min(x, quantity))
-        )
-        .round()
-        .astype(int)
-    )
-
-    df_accum["TradePrice"] = (
-        df_accum.PriceMillionths.sort_index(ascending=False)
-        .rolling(f"{price_window_ms}ms")
-        .agg(price_agg)
-        .sort_index()
-    )
-
-    df_accum["QualifiedTrade"] = df_accum["TradePrice"] == df_accum["PriceMillionths"]
-
-    df_accum["MaxTradeSize"] = round(
-        df_accum.SizeBillionths * max_trade_participation, 0
-    )
-
-    # Calculate trades
-    df_trades = get_trades_df(df_accum)
-    assert (
-        df_trades.StratTradeSize.sum() == quantity
-    ), "Sum of trades does not equal quantity."
-
-    # Prepare result record
-    S0 = df_accum.iloc[0].PriceMillionths
-    VWAP = round(
-        df_trades.StratTradePrice.astype(object).dot(
-            df_trades.StratTradeSize.astype(object)
-        )
-        / quantity
-    )
-    IS = VWAP / S0 - 1 if side else 1 - VWAP / S0
-
-    completion_time = df_trades.index.max()
-
-    result = dict(
-        quantity=int(quantity),
-        side=side,
-        S0=S0,
-        VWAP=VWAP,
-        IS=IS,
-        n_trades=len(df_trades),
-        mean_trade_size=int(df_trades.StratTradeSize.mean()),
-        arrival_time=df_accum.index.min(),
-        completion_time=completion_time,
-        execution_time=completion_time - df_accum.index.min(),
-        participation=participation,
-        max_trade_participation=max_trade_participation,
-        chunk_size=int(chunk_size),
-        price_window_ms=price_window_ms,
-    )
-
-    return df_accum.loc[: df_trades.index.max()], df_trades, result
-
-
-def get_trades_df(df_accum: pd.DataFrame) -> pd.DataFrame:
-    """Calculates trades from accumulation dataframe."""
-
-    trades = []
-    cum_trades = 0
-    tick_idx = 0
-    while cum_trades < df_accum.CumParticipation.max():
-        tick = df_accum.iloc[tick_idx]
-
-        if tick.CumParticipation - cum_trades > 0 and tick.QualifiedTrade:
-            trade_size = min(tick.CumParticipation - cum_trades, tick.MaxTradeSize)
-            trades.append((tick.name, trade_size, tick.TradePrice))
-            cum_trades += trade_size
-
-        tick_idx += 1
-
-    df_trades = (
-        pd.DataFrame(
-            trades,
-            columns=["timestamp_utc_nanoseconds", "StratTradeSize", "StratTradePrice"],
-        )
-        .set_index("timestamp_utc_nanoseconds")
-        .astype(int)
-    )
-
-    return df_trades
-
-
-def get_results_df(df: pd.DataFrame, params: Dict, nobs: int = 100) -> pd.DataFrame:
-    """Runs strategy for given number of observations and returns results
-    dataframe.
+def get_data(date_range: pd.date_range) -> pd.DataFrame:
+    """
+    Loads spreads and prices, calculates spreads and returns dataframe.
     """
 
-    results = []
-    while len(results) < nobs:
-        params["arrival_time"] = np.random.choice(df.index.unique())
-        try:
-            results.append(get_accum_df(df, **params)[-1])
-        except:
-            pass
+    # load spreads data
+    df_spreads = (
+        pd.read_csv("Liq5YCDS.delim", sep="\t", index_col=0, parse_dates=["date"])
+        .set_index(["ticker", "date"])
+        .unstack("ticker")
+        .loc[date_range, ["spread5y"]]
+    )
+    df_returns = np.log(df_spreads / df_spreads.shift())
+    df_returns.columns = df_returns.columns.set_levels(["r_spread"], level=0)
+    df_spreads = pd.concat([df_spreads, df_returns], axis=1)
 
-    return pd.DataFrame(results)
+    # load prices
+    df_prices = (
+        pd.read_csv("df_prices_new.csv", parse_dates=["date"])
+        .set_index(["ticker", "date"])[["adj_close"]]
+        .unstack("ticker")
+        .reindex(date_range)
+        .ffill()
+    )
+    assert len(df_prices) == len(df_spreads)
+
+    df_prices.columns = df_prices.columns.set_names(["series", "ticker"])
+    df_returns = np.log(df_prices / df_prices.shift())
+    df_returns.columns = df_returns.columns.set_levels(["r_equity"], level=0)
+    df_prices = pd.concat([df_prices, df_returns], axis=1)
+    df_data = pd.concat([df_prices, df_spreads], axis=1).iloc[1:]
+    df_data = df_data.stack("ticker")
+    df_data.index = df_data.index.set_names(["date", "ticker"])
+
+    # Excludes return of subject security
+    df_data["r_index"] = (
+        df_data.groupby("date")["r_spread"].transform("sum") - df_data["r_spread"]
+    ) / (df_data.groupby("date")["r_spread"].transform("count") - 1)
+
+    df_data["r_spy"] = df_data.index.get_level_values("date").map(
+        df_data[df_data.index.get_level_values("ticker") == "SPY"]
+        .reset_index()
+        .set_index("date")
+        .r_equity
+    )
+
+    df_data = df_data[df_data.index.get_level_values("ticker") != "SPY"]
+    df_data.index = df_data.index.remove_unused_levels()
+
+    return df_data
+
+
+# =============================================================================
+# Regression
+# =============================================================================
+
+
+def get_errors(
+    df_data: pd.DataFrame,
+    model: str = "OLS",
+    penalty: str = "Huber",
+    weeks_in: int = 16,
+    weeks_out: int = 1,
+    formula: str = "r_equity ~ r_spy + 1",
+):
+
+    errors_list = []
+    for day in df_data.index.levels[0][: -(weeks_in + weeks_out - 1)]:
+        df_in = df_data.loc[day : day + pd.DateOffset(weeks=weeks_in - 1)]
+        df_out = df_data.loc[
+            day
+            + pd.DateOffset(weeks=weeks_in) : day
+            + pd.DateOffset(weeks=weeks_in + weeks_out - 1)
+        ]
+
+        for ticker in df_in.index.levels[1]:
+            y_in, X_in = dmatrices(
+                formula,
+                data=df_in.loc[df_in.index.get_level_values("ticker") == ticker],
+                return_type="dataframe",
+            )
+
+            if model == "OLS":
+                res = sm.OLS(y_in, X_in).fit()
+            else:
+                if penalty == "Tukey":
+                    res = sm.RLM(y_in, X_in, M=sm.robust.norms.TukeyBiweight()).fit()
+                else:
+                    res = sm.RLM(y_in, X_in).fit()
+
+            y_out, X_out = dmatrices(
+                formula,
+                data=df_out.loc[df_out.index.get_level_values("ticker") == ticker],
+                return_type="dataframe",
+            )
+            df_e = (res.predict(X_out) - y_out[formula.split(" ~ ")[0]]).to_frame(
+                name="resid"
+            )
+            df_e["scale"] = res.scale
+            df_e["sresid"] = df_e.resid / df_e.scale
+            df_e["model_date"] = df_in.reset_index().date.min()
+
+            df_e["distance"] = df_e.groupby(["date"]).ngroup() + 1
+            errors_list.append(df_e)
+
+    return pd.concat(errors_list), res.summary()
 
 
 # =============================================================================
 # Charts
 # =============================================================================
 
+
 COLORS = colors.qualitative.T10
 
-IS_labels = [
-    ("obs", lambda x: f"{x:>7d}"),
-    ("min:max", lambda x: f"{x[0]:>0.4f}:{x[1]:>0.3f}"),
-    ("mean", lambda x: f"{x:>7.4f}"),
-    ("std", lambda x: f"{x:>7.4f}"),
-    ("skewness", lambda x: f"{x:>7.4f}"),
-    ("kurtosis", lambda x: f"{x:>7.4f}"),
-]
 
-
-def get_moments_annotation(
-    s: pd.Series,
-    xref: str,
-    yref: str,
-    x: float,
-    y: float,
-    xanchor: str,
-    title: str,
-    labels: List,
-) -> go.layout.Annotation:
-    """Calculates summary statistics for a series and returns and
-    Annotation object.
-    """
-    moments = list(stats.describe(s.to_numpy()))
-    moments[3] = np.sqrt(moments[3])
-
-    sharpe = s.mean() / s.std()
-
-    return go.layout.Annotation(
-        text=(
-            f"<b>sharpe: {sharpe:>8.4f}</b><br>"
-            + ("<br>").join(
-                [f"{k[0]:<9}{k[1](moments[i])}" for i, k in enumerate(labels)]
-            )
-        ),
-        align="left",
-        showarrow=False,
-        xref=xref,
-        yref=yref,
-        x=x,
-        y=y,
-        bordercolor="black",
-        borderwidth=0.5,
-        borderpad=2,
-        bgcolor="white",
-        xanchor=xanchor,
-        yanchor="top",
-    )
-
-
-def make_components_chart(
-    yc_L: str,
-    fx_B: str,
-    fx_L: str,
-    libor: str,
-    leverage: float,
-    date_range: pd.date_range,
-    dfs_yc: Dict,
-    dfs_fx: Dict,
-    dfs_libor: Dict,
-) -> go.Figure:
+def make_histograms(dfs_error):
 
     fig = make_subplots(
         rows=2,
-        cols=2,
-        subplot_titles=[
-            f"5-Year Yield: {yc_L}",
-            f"FX Rate: {fx_L}:{fx_B}",
-            f"3 Month Libor: {libor}",
-            f"FX Rate: {fx_B}:USD",
-        ],
+        cols=1,
+        subplot_titles=["Residuals", "Scaled Residuals"],
         vertical_spacing=0.09,
         horizontal_spacing=0.08,
-        specs=[
-            [{"secondary_y": True}, {"secondary_y": True}],
-            [{"secondary_y": False}, {"secondary_y": True}],
-        ],
     )
 
-    # Lend market yield
-    # =================
-    fig.add_trace(
-        go.Scatter(
-            x=date_range,
-            y=dfs_yc[yc_L].loc[date_range]["5-year"],
-            line=dict(width=1, color=COLORS[0]),
-            name=yc_L,
-        ),
-        row=1,
-        col=1,
-        secondary_y=False,
-    )
+    c = 0
+    for name, df_e in dfs_error.items():
+        c += 1
+        fig.add_trace(
+            go.Histogram(
+                x=df_e.resid,
+                histnorm="percent",
+                name=name,
+                marker_color=COLORS[c],
+            ),
+            row=1,
+            col=1,
+        )
 
-    fig.add_trace(
-        go.Scatter(
-            x=date_range,
-            y=dfs_yc[yc_L].loc[date_range]["5-year"].pct_change() * 100,
-            line=dict(width=1, color=COLORS[1], dash="dot"),
-            name=yc_L,
-        ),
-        row=1,
-        col=1,
-        secondary_y=True,
-    )
-
-    # Borrow market fx
-    # =================
-    fig.add_trace(
-        go.Scatter(
-            x=date_range,
-            y=dfs_fx[fx_B].loc[date_range].rate,
-            line=dict(width=1, color=COLORS[0]),
-            name=fx_B,
-        ),
-        row=2,
-        col=2,
-        secondary_y=False,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=date_range,
-            y=dfs_fx[fx_B].loc[date_range].rate.pct_change() * 100,
-            line=dict(width=1, color=COLORS[1], dash="dot"),
-            name=fx_B,
-        ),
-        row=2,
-        col=2,
-        secondary_y=True,
-    )
-
-    # Borrow market funding cost
-    # =================
-    fig.add_trace(
-        go.Scatter(
-            x=date_range,
-            y=dfs_libor[libor].loc[date_range].value,
-            line=dict(width=1, color=COLORS[0]),
-            name=libor,
-        ),
-        row=2,
-        col=1,
-    )
-
-    # Lend market fx cost
-    # =================
-    fx_BL = (
-        dfs_fx[fx_L].loc[date_range].loc[date_range].rate
-        / dfs_fx[fx_B].loc[date_range].rate
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=date_range,
-            y=fx_BL,
-            line=dict(width=1, color=COLORS[0]),
-            name=fx_L,
-        ),
-        row=1,
-        col=2,
-        secondary_y=False,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=date_range,
-            y=fx_BL.pct_change() * 100,
-            line=dict(width=1, color=COLORS[1], dash="dot"),
-            name=fx_L,
-        ),
-        row=1,
-        col=2,
-        secondary_y=True,
-    )
-
-    fig.update_xaxes(showline=True, linewidth=1, linecolor="grey", mirror=True)
-    fig.update_yaxes(
-        showline=True, linewidth=1, linecolor="grey", mirror=True, tickformat="0.1f"
-    )
+        fig.add_trace(
+            go.Histogram(
+                x=df_e.sresid,
+                histnorm="percent",
+                name=name,
+                showlegend=False,
+                marker_color=COLORS[c],
+            ),
+            row=2,
+            col=1,
+        )
 
     fig.update_layout(
-        title_text=(
-            f"Weekly Carry Trade: Borrow {fx_B}, Lend {yc_L}"
-            "<br>Underlying Securities: "
-            f"{date_range.min().strftime('%Y-%m-%d')}"
-            f" - {date_range.max().strftime('%Y-%m-%d')}"
-        ),
-        showlegend=False,
-        height=600,
+        title_text=("Residuals Histograms"),
+        height=800,
         font=dict(size=10),
         margin=dict(l=50, r=10, b=40, t=90),
-        yaxis3=dict(tickformat="0.3f"),
+        barmode="overlay",
+        yaxis_title="% of all total obs",
+        yaxis2_title="% of all total obs",
+        xaxis_title="error",
+        xaxis2_title="scaled error",
     )
 
     for i in fig["layout"]["annotations"]:
@@ -535,156 +360,89 @@ def make_components_chart(
     return fig
 
 
-def make_returns_chart(df_ret: pd.DataFrame) -> go.Figure:
+def make_cum_error_chart(errors: Dict, scaled: bool = False):
 
-    fx_B, yc_L = df_ret.name.split(",")
+    fig = go.Figure()
 
-    fig = make_subplots(
-        rows=2,
-        cols=2,
-        subplot_titles=[
-            f"Weekly Returns",
-            f"Returns Distribution",
-            f"Cumulative Returns",
-            f"Q/Q Plot",
-        ],
-        vertical_spacing=0.09,
-        horizontal_spacing=0.08,
-    )
-
-    # Returns Distribution
-    returns = pd.cut(df_ret.per_return, 50).value_counts().sort_index()
-    midpoints = returns.index.map(lambda interval: interval.right).to_numpy()
-    norm_dist = stats.norm.pdf(
-        midpoints, loc=df_ret.per_return.mean(), scale=df_ret.per_return.std()
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_ret.index,
-            y=df_ret.per_return * 100,
-            line=dict(width=1, color=COLORS[0]),
-            name="return",
-        ),
-        row=1,
-        col=1,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_ret.index,
-            y=df_ret.per_return.cumsum() * 100,
-            line=dict(width=1, color=COLORS[0]),
-            name="cum. return",
-        ),
-        row=2,
-        col=1,
-    )
-
-    fig.add_trace(
-        go.Bar(
-            x=[interval.mid for interval in returns.index],
-            y=returns / returns.sum() * 100,
-            name="pct. of returns",
-            marker=dict(color=COLORS[0]),
-        ),
-        row=1,
-        col=2,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=[interval.mid for interval in returns.index],
-            y=norm_dist / norm_dist.sum() * 100,
-            name="normal",
-            line=dict(width=1, color=COLORS[1]),
-        ),
-        row=1,
-        col=2,
-    )
-
-    # Q/Q Data
-    returns_norm = (
-        (df_ret.per_return - df_ret.per_return.mean()) / df_ret.per_return.std()
-    ).sort_values()
-    norm_dist = pd.Series(
-        list(map(stats.norm.ppf, np.linspace(0.001, 0.999, len(df_ret.per_return)))),
-        name="normal",
-    )
-
-    fig.append_trace(
-        go.Scatter(
-            x=norm_dist,
-            y=returns_norm,
-            name="return norm.",
-            mode="markers",
-            marker=dict(color=COLORS[0], size=3),
-        ),
-        row=2,
-        col=2,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=norm_dist,
-            y=norm_dist,
-            name="norm.",
-            line=dict(width=1, color=COLORS[1]),
-        ),
-        row=2,
-        col=2,
-    )
-
-    fig.add_annotation(
-        text=(f"{df_ret.per_return.cumsum()[-1] * 100:0.2f}"),
-        xref="paper",
-        yref="y3",
-        x=0.465,
-        y=df_ret.per_return.cumsum()[-1] * 100,
-        xanchor="left",
-        showarrow=False,
-        align="left",
-    )
-
-    fig.add_annotation(
-        get_moments_annotation(
-            df_ret.per_return,
-            xref="paper",
-            yref="paper",
-            x=0.81,
-            y=0.23,
-            xanchor="left",
-            title="Returns",
-            labels=IS_labels,
-        ),
-        font=dict(size=6, family="Courier New, monospace"),
-    )
-
-    fig.update_xaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
-    fig.update_yaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+    for model, df in errors.items():
+        df_cum = get_cum_errors(df, scaled=scaled)
+        fig.add_trace(
+            go.Scatter(
+                x=df_cum.index,
+                y=df_cum.cummean,
+                line=dict(width=2),
+                name=model,
+            ),
+        )
 
     fig.update_layout(
-        title_text=(
-            f"Weekly Carry Trade: Borrow {fx_B}, Lend {yc_L}"
-            "<br>Returns: "
-            f"{df_ret.index.min().strftime('%Y-%m-%d')}"
-            f" - {df_ret.index.max().strftime('%Y-%m-%d')}"
-        ),
-        showlegend=False,
-        height=600,
+        title_text=("Cumulative Mean Error by Quantile"),
+        showlegend=True,
         font=dict(size=10),
-        margin=dict(l=50, r=50, b=50, t=100),
-        yaxis=dict(tickformat="0.1f"),
-        yaxis3=dict(tickformat="0.1f"),
-        yaxis2=dict(tickformat="0.1f"),
-        yaxis4=dict(tickformat="0.1f"),
-        xaxis2=dict(tickformat="0.1f"),
-        xaxis4=dict(tickformat="0.1f"),
+        margin=dict(l=50, r=10, b=40, t=90),
+        xaxis_title=f"{'scaled ' if scaled else ''}cumulative error quantile",
+        yaxis_title=f"{'scaled ' if scaled else ''}error",
+        hovermode="x",
     )
 
-    for i in fig["layout"]["annotations"]:
-        i["font"]["size"] = 12
+    return fig
 
-    fig.update_annotations(font=dict(size=10))
+
+def make_efficiency_chart(errors: Dict, scaled: bool = False):
+
+    efficiency = (
+        get_cum_errors(list(errors.values())[0], scaled=scaled).cummean
+        / get_cum_errors(list(errors.values())[1], scaled=scaled).cummean
+    )
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=efficiency.index,
+            y=efficiency.values,
+            line=dict(width=2),
+            name=(":").join(errors.keys()),
+        ),
+    )
+
+    fig.update_layout(
+        title_text=("Relative Efficiency by Error Quantile"),
+        showlegend=True,
+        font=dict(size=10),
+        margin=dict(l=50, r=10, b=40, t=90),
+        xaxis_title=f"{'scaled ' if scaled else ''}cumulative error quantile",
+        yaxis_title=f"{'scaled ' if scaled else ''}error",
+    )
+
+    return fig
+
+
+def make_residual_chart(errors: Dict, scaled: bool = False):
+
+    resid_type = "sresid" if scaled else "resid"
+
+    df_e0 = list(errors.values())[0]
+    df_e1 = list(errors.values())[1]
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=df_e0[resid_type].sort_values(),
+            y=df_e1[resid_type].sort_values(),
+            name=(":").join(errors.keys()),
+            mode="markers",
+        ),
+    )
+
+    fig.update_layout(
+        title_text=("Residual-Residual Plot"),
+        showlegend=True,
+        font=dict(size=10),
+        margin=dict(l=50, r=10, b=40, t=90),
+        xaxis_title=f"{'scaled ' if scaled else ''}error: {list(errors.keys())[0]}",
+        yaxis_title=f"{'scaled ' if scaled else ''}error {list(errors.keys())[1]}",
+    )
 
     return fig
