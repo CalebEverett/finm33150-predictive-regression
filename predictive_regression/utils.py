@@ -1,3 +1,4 @@
+from ast import Sub
 import gzip
 import hashlib
 import os
@@ -242,6 +243,55 @@ def get_data(date_range: pd.date_range) -> pd.DataFrame:
     return df_data
 
 
+def get_daily_data():
+    """
+    Loads spreads and prices, calculates spreads and returns dataframe on daily
+    basis with no re-indexing.
+    """
+
+    df_spreads = (
+        pd.read_csv("Liq5YCDS.delim", sep="\t", index_col=0, parse_dates=["date"])
+        .set_index(["ticker", "date"])
+        .unstack("ticker")[["spread5y"]]
+    )
+    df_returns = np.log(df_spreads / df_spreads.shift())
+    df_returns.columns = df_returns.columns.set_levels(["r_spread"], level=0)
+    df_spreads = pd.concat([df_spreads, df_returns], axis=1)
+
+    df_prices = (
+        pd.read_csv("df_prices_new.csv", parse_dates=["date"])
+        .set_index(["ticker", "date"])[["adj_close"]]
+        .unstack("ticker")
+        .ffill()
+    )
+
+    df_prices.columns = df_prices.columns.set_names(["series", "ticker"])
+    df_returns = np.log(df_prices / df_prices.shift())
+    df_returns.columns = df_returns.columns.set_levels(["r_equity"], level=0)
+    df_prices = pd.concat([df_prices, df_returns], axis=1)
+    df_data = pd.concat([df_prices, df_spreads], axis=1).iloc[1:]
+    df_data = df_data.stack("ticker")
+    df_data.index = df_data.index.set_names(["date", "ticker"])
+
+    # Excludes return of subject security
+    df_data["r_index"] = (
+        df_data.groupby("date")["r_spread"].transform("sum") - df_data["r_spread"]
+    ) / (df_data.groupby("date")["r_spread"].transform("count") - 1)
+
+    df_data["r_spy"] = df_data.index.get_level_values("date").map(
+        df_data[df_data.index.get_level_values("ticker") == "SPY"]
+        .reset_index()
+        .set_index("date")
+        .r_equity
+    )
+
+    df_data = df_data[df_data.index.get_level_values("ticker") != "SPY"]
+    df_data.index = df_data.index.remove_unused_levels()
+    df_data = df_data.loc["2018-01-03":"2020-04-20"]
+
+    return df_data
+
+
 # =============================================================================
 # Regression
 # =============================================================================
@@ -298,6 +348,103 @@ def get_errors(
     return pd.concat(errors_list), res.summary()
 
 
+def get_contemp_resids(df_data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Wrapper function to return contemporaneous equity and cds
+    residuals.
+    """
+
+    df_eq_errors, _ = get_errors(df_data, model="OLS")
+    df_cds_errors, _ = get_errors(
+        df_data, model="RLM", formula="r_spread ~ r_equity + r_index + 1"
+    )
+
+    df_resid = pd.concat(
+        [df_cds_errors.resid, df_eq_errors.resid.groupby("ticker").shift()], axis=1
+    )
+
+    df_resid.columns = ["cds_resid", "eq_resid"]
+
+    return df_resid.dropna()
+
+
+def get_predicted_resids(df_resid: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates regression coefficients and predicted residuals using
+    discounted least squares for exponentially weighted and boxcar
+    windows of 4 to 60 weeks.
+    """
+
+    df_resid = df_resid.unstack("ticker")
+    win_lengths = np.arange(6, 47, 2)
+
+    col_list = []
+    for w in win_lengths:
+        for s in df_resid.columns.levels[1]:
+            df_pair = df_resid.loc[:, [("cds_resid", s), ("eq_resid", s)]]
+            df_pair.columns = ["cds_resid", "eq_resid"]
+            for win_type, df_win in {
+                "exp_wm": df_pair.ewm(alpha=1 / w),
+                "boxcar": df_pair.rolling(window=2 * w, min_periods=4),
+            }.items():
+                df_cov = df_win.cov()
+                df_mean = df_win.mean()
+
+                s_var = df_cov["eq_resid"].xs("eq_resid", level=1)
+                s_var.name = ("var_x", win_type, f"t_{w:02d}", s)
+
+                s_cov = df_cov["eq_resid"].xs("cds_resid", level=1)
+                s_cov.name = ("cov_xy", win_type, f"t_{w:02d}", s)
+
+                s_beta_1 = s_cov / s_var
+                s_beta_1.name = ("beta_1", win_type, f"t_{w:02d}", s)
+
+                s_beta_0 = s_beta_1 * df_mean.eq_resid - df_mean.cds_resid
+                s_beta_0.name = ("beta_0", win_type, f"t_{w:02d}", s)
+
+                s_resid_sq = (
+                    s_beta_0 + df_pair.eq_resid * s_beta_1 - df_pair.cds_resid
+                ).pow(2)
+                s_resid_sq.name = ("resid_sq", win_type, f"t_{w:02d}", s)
+
+                s_error_sq = (
+                    df_pair.cds_resid.loc[~s_resid_sq.isna()]
+                    - df_pair.cds_resid.loc[~s_resid_sq.isna()].mean()
+                ).pow(2)
+                s_error_sq.name = ("error_sq", win_type, f"t_{w:02d}", s)
+
+                col_list.extend(
+                    [s_resid_sq, s_error_sq, s_beta_0, s_beta_1, s_var, s_cov]
+                )
+
+    df_betas = pd.concat(col_list, axis=1)
+    df_betas.columns.names = ["stat", "win_type", "win_length", "ticker"]
+    df_betas = df_betas.stack("ticker")
+    df_betas = df_betas.swaplevel("stat", "win_type", axis=1)
+
+    return df_betas.sort_index(axis=1)
+
+
+def get_ticker_rsq(df_resid_pred: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates R-squared for each ticker for each combination of window
+    methodology and length.
+    """
+
+    ticker_rsq = []
+    for t in df_resid_pred.index.levels[1]:
+        df = df_resid_pred.loc[df_resid_pred.index.get_level_values("ticker") == t]
+        for w in df_resid_pred.columns.levels[0]:
+            rsq = 1 - df[w].resid_sq.sum() / df[w].error_sq.sum()
+            rsq.name = (t, w)
+            ticker_rsq.append(rsq)
+
+    df_ticker_rsq = pd.concat(ticker_rsq, axis=1).sort_index(axis=1)
+    df_ticker_rsq.columns.names = ["ticker", "win_type"]
+
+    return df_ticker_rsq
+
+
 # =============================================================================
 # Charts
 # =============================================================================
@@ -306,143 +453,266 @@ def get_errors(
 COLORS = colors.qualitative.T10
 
 
-def make_histograms(dfs_error):
+def make_lines_chart(
+    series: pd.Series,
+    title: str = "5-Year CDS Spread",
+) -> go.Figure:
+    fig = go.Figure()
+
+    for t in series.index.levels[1]:
+        fig.add_trace(
+            go.Scatter(
+                x=series.index.levels[0],
+                y=series.loc[series.index.get_level_values("ticker") == t],
+                name=t,
+                line=dict(width=1),
+            )
+        )
+
+    fig.update(layout_title=title)
+
+    return fig
+
+
+IS_labels = [
+    ("obs", lambda x: f"{x:>7d}"),
+    ("min:max", lambda x: f"{x[0]:>0.4f}:{x[1]:>0.3f}"),
+    ("mean", lambda x: f"{x:>7.4f}"),
+    ("std", lambda x: f"{x:>7.4f}"),
+    ("skewness", lambda x: f"{x:>7.4f}"),
+    ("kurtosis", lambda x: f"{x:>7.4f}"),
+]
+
+
+def get_moments_annotation(
+    s: pd.Series,
+    xref: str,
+    yref: str,
+    x: float,
+    y: float,
+    xanchor: str,
+    title: str,
+    labels: List,
+) -> go.layout.Annotation:
+    """Calculates summary statistics for a series and returns and
+    Annotation object.
+    """
+    moments = list(stats.describe(s.to_numpy()))
+    moments[3] = np.sqrt(moments[3])
+
+    sharpe = s.mean() / s.std()
+
+    return go.layout.Annotation(
+        text=(
+            ("<br>").join(
+                [f"{k[0]:<9}{k[1](moments[i])}" for i, k in enumerate(labels)]
+            )
+        ),
+        align="left",
+        showarrow=False,
+        xref=xref,
+        yref=yref,
+        x=x,
+        y=y,
+        bordercolor="black",
+        borderwidth=0.5,
+        borderpad=2,
+        bgcolor="white",
+        xanchor=xanchor,
+        yanchor="top",
+    )
+
+
+def make_overview_chart(
+    series: pd.DataFrame, title: str, subtitle_base: str = "Residuals"
+) -> go.Figure:
 
     fig = make_subplots(
-        rows=2,
-        cols=1,
-        subplot_titles=["Residuals", "Scaled Residuals"],
+        rows=1,
+        cols=2,
+        subplot_titles=[
+            f"{subtitle_base} Distribution",
+            f"Q/Q Plot",
+        ],
         vertical_spacing=0.09,
         horizontal_spacing=0.08,
     )
 
-    c = 0
-    for name, df_e in dfs_error.items():
-        c += 1
-        fig.add_trace(
-            go.Histogram(
-                x=df_e.resid,
-                histnorm="percent",
-                name=name,
-                marker_color=COLORS[c],
-            ),
-            row=1,
-            col=1,
-        )
+    # Returns Distribution
+    series_cuts = pd.cut(series, 100).value_counts().sort_index()
+    midpoints = series_cuts.index.map(lambda interval: interval.right).to_numpy()
+    norm_dist = stats.norm.pdf(midpoints, loc=series.mean(), scale=series.std())
 
-        fig.add_trace(
-            go.Histogram(
-                x=df_e.sresid,
-                histnorm="percent",
-                name=name,
-                showlegend=False,
-                marker_color=COLORS[c],
-            ),
-            row=2,
-            col=1,
-        )
+    fig.add_trace(
+        go.Bar(
+            x=[interval.mid for interval in series_cuts.index],
+            y=series_cuts / series_cuts.sum(),
+            name="pct. of returns",
+            marker=dict(color=COLORS[0]),
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=[interval.mid for interval in series_cuts.index],
+            y=norm_dist / norm_dist.sum(),
+            name="normal",
+            line=dict(width=1, color=COLORS[1]),
+        ),
+        row=1,
+        col=1,
+    )
+
+    # Q/Q Data
+    returns_norm = ((series - series.mean()) / series.std()).sort_values()
+    norm_dist = pd.Series(
+        list(map(stats.norm.ppf, np.linspace(0.001, 0.999, len(series)))),
+        name="normal",
+    )
+
+    fig.append_trace(
+        go.Scatter(
+            x=norm_dist,
+            y=returns_norm,
+            name="resid. norm.",
+            mode="markers",
+            marker=dict(color=COLORS[0], size=3),
+        ),
+        row=1,
+        col=2,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=norm_dist,
+            y=norm_dist,
+            name="norm.",
+            line=dict(width=1, color=COLORS[1]),
+        ),
+        row=1,
+        col=2,
+    )
+
+    fig.add_annotation(
+        get_moments_annotation(
+            series.dropna(),
+            xref="paper",
+            yref="paper",
+            x=0.95,
+            y=0.45,
+            xanchor="right",
+            title="Returns",
+            labels=IS_labels,
+        ),
+        font=dict(size=6, family="Courier New, monospace"),
+    )
+
+    fig.update_xaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+    fig.update_yaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
 
     fig.update_layout(
-        title_text=("Residuals Histograms"),
-        height=800,
+        title_text=(
+            f"{title}<br>"
+            f"{series.index.levels[0].min().strftime('%Y-%m-%d')}"
+            f" - {series.index.levels[0].max().strftime('%Y-%m-%d')}"
+        ),
+        showlegend=False,
+        height=400,
+        width=800,
         font=dict(size=10),
-        margin=dict(l=50, r=10, b=40, t=90),
-        barmode="overlay",
-        yaxis_title="% of all total obs",
-        yaxis2_title="% of all total obs",
-        xaxis_title="error",
-        xaxis2_title="scaled error",
+        margin=dict(l=50, r=50, b=50, t=100),
+        yaxis=dict(tickformat="0.3f"),
+        yaxis2=dict(tickformat="0.1f"),
+        xaxis2=dict(tickformat="0.1f"),
     )
 
     for i in fig["layout"]["annotations"]:
         i["font"]["size"] = 12
 
-    return fig
-
-
-def make_cum_error_chart(errors: Dict, scaled: bool = False):
-
-    fig = go.Figure()
-
-    for model, df in errors.items():
-        df_cum = get_cum_errors(df, scaled=scaled)
-        fig.add_trace(
-            go.Scatter(
-                x=df_cum.index,
-                y=df_cum.cummean,
-                line=dict(width=2),
-                name=model,
-            ),
-        )
-
-    fig.update_layout(
-        title_text=("Cumulative Mean Error by Quantile"),
-        showlegend=True,
-        font=dict(size=10),
-        margin=dict(l=50, r=10, b=40, t=90),
-        xaxis_title=f"{'scaled ' if scaled else ''}cumulative error quantile",
-        yaxis_title=f"{'scaled ' if scaled else ''}error",
-        hovermode="x",
-    )
+    fig.update_annotations(font=dict(size=10))
 
     return fig
 
 
-def make_efficiency_chart(errors: Dict, scaled: bool = False):
+def make_residual_scatter(df_resid: pd.DataFrame, n_trend_obs: int = 200) -> go.Figure:
+    df_resid.eq_resid = df_resid.eq_resid.shift()
+    df_resid = df_resid.dropna()
 
-    efficiency = (
-        get_cum_errors(list(errors.values())[0], scaled=scaled).cummean
-        / get_cum_errors(list(errors.values())[1], scaled=scaled).cummean
+    ols_result = stats.linregress(df_resid.eq_resid, df_resid.cds_resid)
+    # print(ols_result.slope ** 2)
+
+    fig = px.scatter(
+        y=df_resid.cds_resid,
+        x=df_resid.eq_resid,
+        title="Equity Return Residual vs. CDS Return Residual",
+        labels=dict(y="cds residual (n)", x="equity residual (n-1)"),
     )
 
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Scatter(
-            x=efficiency.index,
-            y=efficiency.values,
-            line=dict(width=2),
-            name=(":").join(errors.keys()),
-        ),
+    fig.add_scatter(
+        x=[-0.3, 0.3],
+        y=[ols_result.intercept + ols_result.slope * x for x in [-0.3, 0.3]],
+        mode="lines",
     )
 
-    fig.update_layout(
-        title_text=("Relative Efficiency by Error Quantile"),
-        showlegend=True,
-        font=dict(size=10),
-        margin=dict(l=50, r=10, b=40, t=90),
-        xaxis_title=f"{'scaled ' if scaled else ''}cumulative error quantile",
-        yaxis_title=f"{'scaled ' if scaled else ''}error",
-    )
+    fig.update_layout(showlegend=False)
 
     return fig
 
 
-def make_residual_chart(errors: Dict, scaled: bool = False):
-
-    resid_type = "sresid" if scaled else "resid"
-
-    df_e0 = list(errors.values())[0]
-    df_e1 = list(errors.values())[1]
-
+def make_rsq_comparison(df_resid_pred: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
 
-    fig.add_trace(
-        go.Scatter(
-            x=df_e0[resid_type].sort_values(),
-            y=df_e1[resid_type].sort_values(),
-            name=(":").join(errors.keys()),
-            mode="markers",
-        ),
+    for w in df_resid_pred.columns.levels[0]:
+        rsq = 1 - df_resid_pred[w].resid_sq.sum() / df_resid_pred[w].error_sq.sum()
+        fig.add_trace(go.Bar(x=rsq.index, y=rsq.values, name=w))
+
+    fig.update_layout(title="Comparision of R-squared: Window Type by Length")
+
+    return fig
+
+
+def make_rsq_ticker_comparison(df_resid_pred: pd.DataFrame) -> go.Figure:
+    tickers = {
+        "BA": (1, 1),
+        "C": (1, 2),
+        "DD": (2, 1),
+        "F": (2, 2),
+        "GE": (3, 1),
+        "JPM": (3, 2),
+        "LOW": (4, 1),
+        "LUV": (4, 2),
+        "MAR": (5, 1),
+        "T": (5, 2),
+        "WFC": (6, 1),
+        "XOM": (6, 2),
+    }
+
+    fig = make_subplots(
+        rows=6,
+        cols=2,
+        subplot_titles=list(tickers.keys()),
+        vertical_spacing=0.09,
+        horizontal_spacing=0.08,
     )
 
-    fig.update_layout(
-        title_text=("Residual-Residual Plot"),
-        showlegend=True,
-        font=dict(size=10),
-        margin=dict(l=50, r=10, b=40, t=90),
-        xaxis_title=f"{'scaled ' if scaled else ''}error: {list(errors.keys())[0]}",
-        yaxis_title=f"{'scaled ' if scaled else ''}error {list(errors.keys())[1]}",
-    )
+    for t, (r, c) in tickers.items():
+        for j, w in enumerate(df_resid_pred.columns.levels[1]):
+            fig.add_trace(
+                go.Bar(
+                    x=df_resid_pred.index,
+                    y=df_resid_pred[t][w],
+                    name=w,
+                    marker=dict(color=COLORS[j]),
+                    showlegend=True if t == "BA" else False,
+                    legendgroup=w,
+                ),
+                row=r,
+                col=c,
+            )
 
+    fig.update_layout(title="Comparision of R-squared: Window Type by Length")
+
+    fig.update_layout(width=1000, height=1600)
     return fig
