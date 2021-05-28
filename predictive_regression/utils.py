@@ -619,8 +619,6 @@ def make_overview_chart(
             f" - {series.index.levels[0].max().strftime('%Y-%m-%d')}"
         ),
         showlegend=False,
-        height=400,
-        width=800,
         font=dict(size=10),
         margin=dict(l=50, r=50, b=50, t=100),
         yaxis=dict(tickformat="0.3f"),
@@ -714,5 +712,5 @@ def make_rsq_ticker_comparison(df_resid_pred: pd.DataFrame) -> go.Figure:
 
     fig.update_layout(title="Comparision of R-squared: Window Type by Length")
 
-    fig.update_layout(width=1000, height=1600)
+    fig.update_layout(height=1600)
     return fig
