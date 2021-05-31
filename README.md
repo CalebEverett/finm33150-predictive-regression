@@ -80,3 +80,5 @@ As mentioned above, we try to improve the performance of our models by reducing 
 * The best combination of window methodology and length turned out to be a boxcar window with a length of 24 weeks and resulted in an overall $R^{2}$ of 0.093.
 
 * By pulling out the best window methodology-length combination for each ticker were able to increase our overall $R^2$ to 0.131.
+
+![Comparison of E-Squared](comparison.png)
