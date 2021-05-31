@@ -1,5 +1,5 @@
 [![build status](https://github.com/CalebEverett/finm33150-predictive-regression/actions/workflows/build.yml/badge.svg)](https://github.com/CalebEverett/finm33150-predictive-regression/actions/workflows/build.yml)
-[![viewer](https://img.shields.io/badge/notebook-viewer-blue)](https://calebeverett.github.io/CalebEverett/finm33150-predictive-regression/)
+[![viewer](https://img.shields.io/badge/notebook-viewer-blue)](https://calebeverett.github.io/finm33150-predictive-regression/)
 
 # FINM33150 - Predictive Regression
 
